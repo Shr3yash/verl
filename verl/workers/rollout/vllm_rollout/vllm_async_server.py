@@ -1427,8 +1427,16 @@ class vLLMHttpServer:
         collective_rpc only reaches the TP workers within a single DP shard,
         leaving other DP shards' weights unreleased, which causes OOM during
         FSDP training backward when DP > 1.
+
+        Level 2 discards parameter storage. Wake does not restore it, and a raw
+        load_weights afterwards can leave the sampler reading uninitialized
+        kernel tensors (verl-project/verl#7904). The worker reloads on the next
+        full sync; this mark is what tells it the discard happened.
         """
-        await self.engine.sleep(level=self._resolve_sleep_level())
+        level = self._resolve_sleep_level()
+        await self.engine.sleep(level=level)
+        if level >= 2:
+            await self.engine.collective_rpc("mark_sleep_discarded_weights")
         await self.engine.reset_encoder_cache()
 
 

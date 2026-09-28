@@ -216,6 +216,9 @@ class vLLMColocateWorkerExtension:
         instance = super().__new__(cls)
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
+        # Set by mark_sleep_discarded_weights after a level-2 sleep. The next
+        # full sync has to reload into the kernel tensors wake remaps.
+        instance._verl_weights_discarded = False
         return instance
 
     def _get_drafter_model(self):
@@ -258,6 +261,16 @@ class vLLMColocateWorkerExtension:
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
+    def mark_sleep_discarded_weights(self) -> None:
+        """Level-2 sleep discarded parameter storage.
+
+        The next full weight sync must reload into the kernel tensors that wake
+        remaps. A raw ``load_weights`` is not that reload: vLLM only treats
+        ``reload_weights`` / ``finish_weight_update`` as restoring discarded
+        weights, and generation on the uninitialized storage is silent garbage.
+        """
+        self._verl_weights_discarded = True
+
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
         if self.device is None:
@@ -268,6 +281,30 @@ class vLLMColocateWorkerExtension:
         # =========================== step 1: prepare for weight loading ===========================
         quant_reload_states = None
         staged_moe_layers = []
+        # Level-2 sleep frees parameter storage. vLLM's reload_weights copies
+        # processed weights back into the kernel tensors that wake remaps.
+        # Bucketed IPC still calls load_weights; bracketing that call with the
+        # layerwise reload is the same restore. LoRA-adapter, QAT, and quantized
+        # syncs have their own post-load and must not take this path.
+        discarded = getattr(self, "_verl_weights_discarded", False)
+        use_layerwise_reload = bool(
+            discarded
+            and not (peft_config and base_sync_done)
+            and not self._is_qat_model
+            and not self._is_modelopt_qat
+            and not is_quantized_model(self.model_runner.vllm_config)
+        )
+        if use_layerwise_reload:
+            from vllm.model_executor.model_loader.reload import (
+                finalize_layerwise_reload,
+                initialize_layerwise_reload,
+            )
+        elif discarded:
+            logger.warning(
+                "vLLM sleep discarded rollout weights, but this sync cannot use the layerwise reload "
+                "(LoRA adapter, QAT, or quantized). Generation may be garbage until a full checkpoint "
+                "reload. See verl-project/verl#7904."
+            )
 
         # The engine came up on dummy weights, whose init zeroes integer buffers on
         # ROCm -- including the expert-parallel routing maps, which no weight stream
@@ -296,6 +333,15 @@ class vLLMColocateWorkerExtension:
             quant_reload_states = [
                 (model, prepare_quanted_weights_for_loading(model)) for model in self._iter_all_models()
             ]
+        elif use_layerwise_reload:
+            # Layerwise reload owns the kernel layout: staging MoE params here would
+            # hand load_weights a view that finalize then overwrites. See #7904.
+            logger.info(
+                "Level-2 sleep discarded rollout weights; reloading with initialize_layerwise_reload "
+                "so the new checkpoint is copied into the kernel tensors (#7904)."
+            )
+            for model in self._iter_all_models():
+                initialize_layerwise_reload(model)
         else:
             # TODO(wuxibin): not need anymore for newer vllm version.
             for model in self._iter_all_models():
@@ -356,6 +402,14 @@ class vLLMColocateWorkerExtension:
         elif is_quantized_model(self.model_runner.vllm_config):
             for model, reload_state in quant_reload_states:
                 process_quanted_weights_after_loading(model, reload_state)
+        elif use_layerwise_reload:
+            # finalize copies processed values into the saved kernel storage and
+            # runs the leftover process_weights_after_loading itself. A second
+            # pass here is not idempotent. Clear the flag only after success so
+            # a failed reload is retried on the next sync.
+            for model, model_config in self._iter_all_models_with_config():
+                finalize_layerwise_reload(model, model_config)
+            self._verl_weights_discarded = False
         else:
             # Some post-load transforms are non-idempotent; run once after all buckets.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
